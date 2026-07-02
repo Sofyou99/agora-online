@@ -16,7 +16,7 @@ type PostRow = {
   duration_minutes: number;
   extended_minutes: number;
 };
-type PeerEntry = { pc: RTCPeerConnection; isCaller: boolean; answerApplied: boolean };
+type PeerEntry = { pc: RTCPeerConnection | null; isCaller: boolean; answerApplied: boolean; pending?: boolean };
 type SpeakingDetector = { ctx: AudioContext; raf: number };
 
 export default function RoomPage() {
@@ -56,6 +56,16 @@ export default function RoomPage() {
   const partnerNamesRef = useRef<string[]>([]);
   const speakingDetectorsRef = useRef<Record<string, SpeakingDetector>>({});
   const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const postBackstopPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const mediaReadyRef = useRef<{ promise: Promise<void>; resolve: () => void }>(
+    (() => {
+      let resolveFn: () => void = () => {};
+      const promise = new Promise<void>((res) => {
+        resolveFn = res;
+      });
+      return { promise, resolve: resolveFn };
+    })()
+  );
 
   useEffect(() => {
     postRef.current = post;
@@ -88,31 +98,59 @@ export default function RoomPage() {
       if (cancelled) return;
       setPost(postData as PostRow);
 
-      await tryAcquireMedia(userId);
-
+      // Presence and the timer must never wait on a camera/mic permission
+      // prompt — join the room and start syncing immediately. Actual
+      // video/audio connections wait for media separately, below.
       setupPostSubscription();
       setupVotesSubscription(userId);
       setupRoomChannel(userId, name);
       startHeartbeat(userId);
+      startPostBackstopPoll();
+
+      tryAcquireMedia(userId);
+    }
+
+    function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('media request timed out')), ms);
+        promise.then(
+          (v) => {
+            clearTimeout(timer);
+            resolve(v);
+          },
+          (e) => {
+            clearTimeout(timer);
+            reject(e);
+          }
+        );
+      });
     }
 
     async function tryAcquireMedia(userId: string) {
       // Try camera+mic, then mic-only, then no media at all — but in every
-      // case we still join the room's presence channel below, so a device
-      // with no working camera/mic still shows up as present to everyone
-      // else instead of silently vanishing.
+      // case the room, presence, and timer are already running above, so a
+      // device with no working camera/mic (or a slow permission prompt)
+      // still shows up as present to everyone else instead of blocking or
+      // silently vanishing.
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        const stream = await withTimeout(
+          navigator.mediaDevices.getUserMedia({ video: true, audio: true }),
+          8000
+        );
         localStreamRef.current = stream;
         if (localVideoRef.current) localVideoRef.current.srcObject = stream;
         startSpeakingDetection(userId, stream);
         setMediaState('full');
+        mediaReadyRef.current.resolve();
         return;
       } catch (e) {
         // fall through to audio-only
       }
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+        const stream = await withTimeout(
+          navigator.mediaDevices.getUserMedia({ video: false, audio: true }),
+          8000
+        );
         localStreamRef.current = stream;
         setCamOn(false);
         startSpeakingDetection(userId, stream);
@@ -120,6 +158,7 @@ export default function RoomPage() {
         setError(
           "We couldn't access your camera, so you're joining audio-only. Others will still see and hear you're here."
         );
+        mediaReadyRef.current.resolve();
         return;
       } catch (e) {
         // fall through to no media
@@ -128,6 +167,18 @@ export default function RoomPage() {
       setError(
         "We couldn't access your camera or microphone at all. Check your browser's permission icon in the address bar and allow access, then rejoin — you're still visible to others in the room, just without audio or video for now."
       );
+      mediaReadyRef.current.resolve();
+    }
+
+    function startPostBackstopPoll() {
+      // The realtime subscription above should keep everyone's timer in
+      // sync instantly, but if a push ever gets missed, this makes sure
+      // both sides converge within a few seconds regardless.
+      const poll = setInterval(async () => {
+        const { data } = await supabase.from('posts').select('*').eq('id', postId).single();
+        if (data) setPost(data as PostRow);
+      }, 5000);
+      postBackstopPollRef.current = poll;
     }
 
     boot();
@@ -214,7 +265,7 @@ export default function RoomPage() {
     Object.keys(peersRef.current).forEach((pid) => {
       if (!list.some((p) => p.id === pid)) {
         try {
-          peersRef.current[pid].pc.close();
+          peersRef.current[pid].pc?.close();
         } catch (e) {}
         delete peersRef.current[pid];
         stopSpeakingDetection(pid);
@@ -224,7 +275,7 @@ export default function RoomPage() {
     });
 
     const connectedCount = Object.values(peersRef.current).filter(
-      (p: PeerEntry) => p.pc.connectionState === 'connected'
+      (p: PeerEntry) => p.pc?.connectionState === 'connected'
     ).length;
     if (list.length < 2) {
       setLive(false);
@@ -239,6 +290,18 @@ export default function RoomPage() {
   }
 
   async function createPeerConnection(peerId: string, isCaller: boolean, userId: string) {
+    // Mark this peer as being set up immediately (synchronously) so a
+    // second presence sync during the wait below can't try to create a
+    // duplicate connection for the same person.
+    peersRef.current[peerId] = { pc: null, isCaller, answerApplied: false, pending: true };
+
+    // Give media up to 5s to resolve so the initial offer/answer carries
+    // our tracks — but never block the connection indefinitely on it.
+    await Promise.race([mediaReadyRef.current.promise, new Promise<void>((res) => setTimeout(res, 5000))]);
+
+    // If the peer already left while we were waiting, bail out quietly.
+    if (!peersRef.current[peerId] || !peersRef.current[peerId].pending) return;
+
     const pc = new RTCPeerConnection({ iceServers: getIceServers() });
     peersRef.current[peerId] = { pc, isCaller, answerApplied: false };
 
@@ -299,8 +362,18 @@ export default function RoomPage() {
 
   async function handleSignal(payload: any, userId: string) {
     const peerId = payload.from;
-    const entry = peersRef.current[peerId];
+    let entry = peersRef.current[peerId];
     if (!entry) return;
+
+    if (entry.pending || !entry.pc) {
+      // Our own connection object for this peer isn't ready yet (still
+      // waiting on media) — wait for the same bounded window
+      // createPeerConnection uses, then re-check.
+      await Promise.race([mediaReadyRef.current.promise, new Promise<void>((res) => setTimeout(res, 5000))]);
+      entry = peersRef.current[peerId];
+      if (!entry || !entry.pc) return;
+    }
+
     const pc = entry.pc;
 
     if (payload.kind === 'offer') {
@@ -445,7 +518,7 @@ export default function RoomPage() {
   function cleanupAll() {
     Object.values(peersRef.current).forEach((p: PeerEntry) => {
       try {
-        p.pc.close();
+        p.pc?.close();
       } catch (e) {}
     });
     peersRef.current = {};
@@ -460,6 +533,10 @@ export default function RoomPage() {
     if (heartbeatIntervalRef.current) {
       clearInterval(heartbeatIntervalRef.current);
       heartbeatIntervalRef.current = null;
+    }
+    if (postBackstopPollRef.current) {
+      clearInterval(postBackstopPollRef.current);
+      postBackstopPollRef.current = null;
     }
   }
 
