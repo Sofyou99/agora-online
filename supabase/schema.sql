@@ -118,7 +118,8 @@ create trigger trg_maybe_start_timer
   after insert on public.post_participants
   for each row execute function public.maybe_start_timer();
 
--- Mark a post concluded once the last person leaves.
+-- Delete a post entirely once the last person leaves (instead of just
+-- marking it concluded) so the plaza never accumulates empty rooms.
 create or replace function public.maybe_conclude_post()
 returns trigger
 language plpgsql
@@ -126,7 +127,7 @@ security definer
 as $$
 begin
   if (select count(*) from public.post_participants where post_id = old.post_id) = 0 then
-    update public.posts set status = 'concluded' where id = old.post_id;
+    delete from public.posts where id = old.post_id;
   end if;
   return old;
 end;
@@ -137,26 +138,70 @@ create trigger trg_maybe_conclude_post
   after delete on public.post_participants
   for each row execute function public.maybe_conclude_post();
 
--- Callable from the client: add 15 minutes, but only if you're
--- actually in the room.
-create or replace function public.extend_time(p_post_id uuid)
-returns void
+-- One row per person currently voting to extend the current conversation.
+-- Cleared automatically once enough people agree.
+create table if not exists public.post_extend_votes (
+  post_id uuid not null references public.posts(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key (post_id, user_id)
+);
+
+-- When votes reach the required threshold, add 15 minutes and reset the
+-- votes so the next extension needs fresh agreement. Threshold is "both"
+-- for a duo (2 of 2) and a strict majority for a circle (e.g. 3 of 5).
+create or replace function public.maybe_apply_extend_vote()
+returns trigger
+language plpgsql
+security definer
+as $$
+declare
+  total int;
+  votes int;
+  required int;
+begin
+  perform 1 from public.posts where id = new.post_id for update;
+
+  select count(*) into total from public.post_participants where post_id = new.post_id;
+  if total = 0 then
+    return new;
+  end if;
+
+  required := (total / 2) + 1;
+  select count(*) into votes from public.post_extend_votes where post_id = new.post_id;
+
+  if votes >= required then
+    update public.posts set extended_minutes = extended_minutes + 15 where id = new.post_id;
+    delete from public.post_extend_votes where post_id = new.post_id;
+  end if;
+
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_maybe_apply_extend_vote on public.post_extend_votes;
+create trigger trg_maybe_apply_extend_vote
+  after insert on public.post_extend_votes
+  for each row execute function public.maybe_apply_extend_vote();
+
+-- If someone leaves before a vote resolves, their vote shouldn't keep
+-- counting toward the threshold.
+create or replace function public.cleanup_vote_on_leave()
+returns trigger
 language plpgsql
 security definer
 as $$
 begin
-  if not exists (
-    select 1 from public.post_participants
-    where post_id = p_post_id and user_id = auth.uid()
-  ) then
-    raise exception 'Only people in the conversation can extend the timer.';
-  end if;
-
-  update public.posts
-  set extended_minutes = extended_minutes + 15
-  where id = p_post_id;
+  delete from public.post_extend_votes
+  where post_id = old.post_id and user_id = old.user_id;
+  return old;
 end;
 $$;
+
+drop trigger if exists trg_cleanup_vote_on_leave on public.post_participants;
+create trigger trg_cleanup_vote_on_leave
+  after delete on public.post_participants
+  for each row execute function public.cleanup_vote_on_leave();
 
 -- ============================================================
 -- ROW LEVEL SECURITY
@@ -228,6 +273,32 @@ create policy "history is private to each user"
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
 
+alter table public.post_extend_votes enable row level security;
+
+drop policy if exists "votes are readable by anyone signed in" on public.post_extend_votes;
+create policy "votes are readable by anyone signed in"
+  on public.post_extend_votes for select
+  to authenticated
+  using (true);
+
+drop policy if exists "only current participants can vote to extend" on public.post_extend_votes;
+create policy "only current participants can vote to extend"
+  on public.post_extend_votes for insert
+  to authenticated
+  with check (
+    auth.uid() = user_id
+    and exists (
+      select 1 from public.post_participants
+      where post_id = post_extend_votes.post_id and user_id = auth.uid()
+    )
+  );
+
+drop policy if exists "you can retract your own vote" on public.post_extend_votes;
+create policy "you can retract your own vote"
+  on public.post_extend_votes for delete
+  to authenticated
+  using (auth.uid() = user_id);
+
 -- ============================================================
 -- REALTIME
 -- Make sure changes to the board are pushed to everyone live.
@@ -244,5 +315,11 @@ end $$;
 do $$
 begin
   alter publication supabase_realtime add table public.post_participants;
+exception when others then null;
+end $$;
+
+do $$
+begin
+  alter publication supabase_realtime add table public.post_extend_votes;
 exception when others then null;
 end $$;

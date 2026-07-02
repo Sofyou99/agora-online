@@ -17,6 +17,7 @@ type PostRow = {
   extended_minutes: number;
 };
 type PeerEntry = { pc: RTCPeerConnection; isCaller: boolean; answerApplied: boolean };
+type SpeakingDetector = { ctx: AudioContext; raf: number };
 
 export default function RoomPage() {
   const params = useParams<{ id: string }>();
@@ -35,7 +36,9 @@ export default function RoomPage() {
   const [showWrapup, setShowWrapup] = useState(false);
   const [wrapupSummary, setWrapupSummary] = useState('');
   const [stars, setStars] = useState(0);
-  const [reflection, setReflection] = useState('');
+  const [voteCount, setVoteCount] = useState(0);
+  const [voteRequired, setVoteRequired] = useState(2);
+  const [hasVoted, setHasVoted] = useState(false);
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
@@ -43,10 +46,12 @@ export default function RoomPage() {
   const peersRef = useRef<Record<string, PeerEntry>>({});
   const roomChannelRef = useRef<any>(null);
   const postChannelRef = useRef<any>(null);
+  const votesChannelRef = useRef<any>(null);
   const myIdRef = useRef<string | null>(null);
   const myNameRef = useRef<string>('Someone');
   const postRef = useRef<PostRow | null>(null);
   const partnerNamesRef = useRef<string[]>([]);
+  const speakingDetectorsRef = useRef<Record<string, SpeakingDetector>>({});
 
   useEffect(() => {
     postRef.current = post;
@@ -87,6 +92,7 @@ export default function RoomPage() {
         }
         localStreamRef.current = stream;
         if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        startSpeakingDetection(userId, stream);
       } catch (e) {
         setError(
           "We couldn't access your camera or microphone. Check your browser's permission icon in the address bar, allow access, then rejoin from the plaza."
@@ -95,7 +101,8 @@ export default function RoomPage() {
         return;
       }
 
-      setupPostSubscription(userId);
+      setupPostSubscription();
+      setupVotesSubscription(userId);
       setupRoomChannel(userId, name);
     }
 
@@ -107,7 +114,7 @@ export default function RoomPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [postId]);
 
-  function setupPostSubscription(userId: string) {
+  function setupPostSubscription() {
     const ch = supabase
       .channel(`post-row-${postId}`)
       .on(
@@ -117,6 +124,26 @@ export default function RoomPage() {
       )
       .subscribe();
     postChannelRef.current = ch;
+  }
+
+  async function refreshVotes(userId: string) {
+    const { data } = await supabase.from('post_extend_votes').select('user_id').eq('post_id', postId);
+    const rows = data || [];
+    setVoteCount(rows.length);
+    setHasVoted(rows.some((r: any) => r.user_id === userId));
+  }
+
+  function setupVotesSubscription(userId: string) {
+    refreshVotes(userId);
+    const ch = supabase
+      .channel(`extend-votes-${postId}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'post_extend_votes', filter: `post_id=eq.${postId}` },
+        () => refreshVotes(userId)
+      )
+      .subscribe();
+    votesChannelRef.current = ch;
   }
 
   function setupRoomChannel(userId: string, name: string) {
@@ -129,6 +156,7 @@ export default function RoomPage() {
         return { id: key, name: meta.name, joinedAt: meta.joinedAt };
       });
       setParticipants(list);
+      setVoteRequired(Math.floor(list.length / 2) + 1);
       partnerNamesRef.current = list.filter((p) => p.id !== userId).map((p) => p.name);
       reconcilePeers(list, userId);
     });
@@ -165,6 +193,7 @@ export default function RoomPage() {
           peersRef.current[pid].pc.close();
         } catch (e) {}
         delete peersRef.current[pid];
+        stopSpeakingDetection(pid);
       }
     });
 
@@ -192,6 +221,7 @@ export default function RoomPage() {
     pc.ontrack = (ev) => {
       const v = videoRefs.current[peerId];
       if (v) v.srcObject = ev.streams[0];
+      startSpeakingDetection(peerId, ev.streams[0]);
     };
 
     pc.onicecandidate = (ev) => {
@@ -256,6 +286,50 @@ export default function RoomPage() {
     }
   }
 
+  // ---------- speaking indicator ----------
+  function startSpeakingDetection(id: string, stream: MediaStream) {
+    if (speakingDetectorsRef.current[id]) return;
+    if (stream.getAudioTracks().length === 0) return;
+    try {
+      const ctx = new AudioContext();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
+
+      const loop = () => {
+        analyser.getByteTimeDomainData(data);
+        let sumSquares = 0;
+        for (let i = 0; i < data.length; i++) {
+          const v = (data[i] - 128) / 128;
+          sumSquares += v * v;
+        }
+        const rms = Math.sqrt(sumSquares / data.length);
+        const el = document.getElementById('pane-' + id);
+        if (el) el.classList.toggle('speaking', rms > 0.045);
+        const raf = requestAnimationFrame(loop);
+        if (speakingDetectorsRef.current[id]) speakingDetectorsRef.current[id].raf = raf;
+      };
+      const raf = requestAnimationFrame(loop);
+      speakingDetectorsRef.current[id] = { ctx, raf };
+    } catch (e) {
+      // Web Audio API unavailable — speaking indicator just won't show, no functional impact.
+    }
+  }
+  function stopSpeakingDetection(id: string) {
+    const d = speakingDetectorsRef.current[id];
+    if (d) {
+      cancelAnimationFrame(d.raf);
+      try {
+        d.ctx.close();
+      } catch (e) {}
+      delete speakingDetectorsRef.current[id];
+    }
+    const el = document.getElementById('pane-' + id);
+    if (el) el.classList.remove('speaking');
+  }
+
   // ---------- timer ----------
   useEffect(() => {
     const tick = () => {
@@ -286,8 +360,10 @@ export default function RoomPage() {
     return () => clearInterval(t);
   }, [post]);
 
-  async function extendTime() {
-    const { error } = await supabase.rpc('extend_time', { p_post_id: postId });
+  async function castExtendVote() {
+    const userId = myIdRef.current;
+    if (!userId || hasVoted) return;
+    const { error } = await supabase.from('post_extend_votes').upsert({ post_id: postId, user_id: userId });
     if (error) alert(error.message);
   }
 
@@ -312,12 +388,14 @@ export default function RoomPage() {
       } catch (e) {}
     });
     peersRef.current = {};
+    Object.keys(speakingDetectorsRef.current).forEach(stopSpeakingDetection);
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
       localStreamRef.current = null;
     }
     if (roomChannelRef.current) supabase.removeChannel(roomChannelRef.current);
     if (postChannelRef.current) supabase.removeChannel(postChannelRef.current);
+    if (votesChannelRef.current) supabase.removeChannel(votesChannelRef.current);
   }
 
   async function leaveRoom() {
@@ -334,7 +412,6 @@ export default function RoomPage() {
       partners.length ? `You talked through "${topic}" with ${partners.join(', ')}.` : `You opened the floor on "${topic}".`
     );
     setStars(0);
-    setReflection('');
     setShowWrapup(true);
   }
 
@@ -348,7 +425,6 @@ export default function RoomPage() {
         mode: p.mode,
         partners: partnerNamesRef.current,
         rating: stars,
-        reflection: reflection.trim() || null,
       });
     }
     router.push('/plaza');
@@ -358,6 +434,11 @@ export default function RoomPage() {
   const stageClass = 'video-stage ' + (post?.mode === 'duo' ? 'mode-duo' : 'mode-group');
   const others = participants.filter((p) => p.id !== myIdRef.current);
   const openSeats = post ? Math.max(0, post.max_seats - participants.length) : 0;
+  const extendLabel = hasVoted
+    ? `Waiting on others (${voteCount}/${voteRequired})`
+    : post?.mode === 'duo'
+    ? 'Agree to +15 min'
+    : `Vote to +15 min (${voteCount}/${voteRequired})`;
 
   return (
     <div className="app">
@@ -380,17 +461,17 @@ export default function RoomPage() {
         <div className="timer-panel">
           <div className={'timer-value' + (overtime ? ' overtime' : '')}>{timerText}</div>
           <div className="timer-caption">time remaining</div>
-          <button className="btn btn-ghost btn-sm" onClick={extendTime}>
-            +15 min
+          <button className="btn btn-ghost btn-sm" onClick={castExtendVote} disabled={hasVoted}>
+            {extendLabel}
           </button>
         </div>
       </div>
 
       {overtime && post?.started_at && (
         <div className="overtime-banner">
-          <span>Time&apos;s up — the conversation can keep going if you want it to.</span>
-          <button className="btn btn-primary btn-sm" onClick={extendTime}>
-            Add 15 more minutes
+          <span>Time&apos;s up — the conversation can keep going if everyone agrees.</span>
+          <button className="btn btn-primary btn-sm" onClick={castExtendVote} disabled={hasVoted}>
+            {extendLabel}
           </button>
         </div>
       )}
@@ -398,14 +479,17 @@ export default function RoomPage() {
       {error && <div className="error-banner">{error}</div>}
 
       <div className={stageClass}>
-        <div className="video-pane">
+        <div className="video-pane" id={'pane-' + (myIdRef.current || 'me')}>
           <video ref={localVideoRef} autoPlay playsInline muted />
           <div className="video-label">you</div>
         </div>
 
         {others.map((p) => (
-          <div className="video-pane" key={p.id}>
-            <div className="video-placeholder" style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+          <div className="video-pane" id={'pane-' + p.id} key={p.id}>
+            <div
+              className="video-placeholder"
+              style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
+            >
               <div className="initial-badge">
                 {p.name
                   .trim()
@@ -465,11 +549,6 @@ export default function RoomPage() {
                 </button>
               ))}
             </div>
-            <textarea
-              placeholder="One line on what stuck with you (optional)"
-              value={reflection}
-              onChange={(e) => setReflection(e.target.value)}
-            />
             <div className="wrapup-actions">
               <button className="btn btn-primary" onClick={finishWrapup}>
                 Back to the plaza
