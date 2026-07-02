@@ -41,6 +41,7 @@ export default function RoomPage() {
   const [hasVoted, setHasVoted] = useState(false);
   const [mediaState, setMediaState] = useState<'pending' | 'full' | 'audio-only' | 'none'>('pending');
   const [needsAudioUnlock, setNeedsAudioUnlock] = useState<string[]>([]);
+  const [trackReceivedIds, setTrackReceivedIds] = useState<string[]>([]);
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
@@ -218,6 +219,7 @@ export default function RoomPage() {
         delete peersRef.current[pid];
         stopSpeakingDetection(pid);
         setNeedsAudioUnlock((prev) => prev.filter((id) => id !== pid));
+        setTrackReceivedIds((prev) => prev.filter((id) => id !== pid));
       }
     });
 
@@ -243,6 +245,7 @@ export default function RoomPage() {
     localStreamRef.current?.getTracks().forEach((t) => pc.addTrack(t, localStreamRef.current as MediaStream));
 
     pc.ontrack = (ev) => {
+      setTrackReceivedIds((prev) => (prev.includes(peerId) ? prev : [...prev, peerId]));
       const v = videoRefs.current[peerId];
       if (v) {
         v.srcObject = ev.streams[0];
@@ -251,7 +254,7 @@ export default function RoomPage() {
           playPromise.catch(() => {
             // Many mobile browsers block autoplay of an unmuted remote
             // stream until the person taps something — surface a button
-            // instead of silently never playing audio.
+            // instead of silently never playing audio or video.
             setNeedsAudioUnlock((prev) => (prev.includes(peerId) ? prev : [...prev, peerId]));
           });
         }
@@ -542,10 +545,11 @@ export default function RoomPage() {
 
       <div className={stageClass}>
         <div className="video-pane" id={'pane-' + (myIdRef.current || 'me')}>
-          {mediaState === 'full' && camOn ? (
-            <video ref={localVideoRef} autoPlay playsInline muted />
-          ) : (
-            <div className="video-placeholder">
+          {(mediaState !== 'full' || !camOn) && (
+            <div
+              className="video-placeholder"
+              style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
+            >
               <div className="initial-badge">
                 {myNameRef.current
                   .trim()
@@ -558,36 +562,41 @@ export default function RoomPage() {
               {mediaState === 'none' ? 'no camera or mic' : mediaState === 'audio-only' ? 'audio only' : 'camera off'}
             </div>
           )}
+          <video
+            ref={localVideoRef}
+            autoPlay
+            playsInline
+            muted
+            style={{ display: mediaState === 'full' && camOn ? 'block' : 'none' }}
+          />
           <div className="video-label">you</div>
         </div>
 
         {others.map((p) => (
           <div className="video-pane" id={'pane-' + p.id} key={p.id}>
-            <div
-              className="video-placeholder"
-              style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
-            >
-              <div className="initial-badge">
-                {p.name
-                  .trim()
-                  .split(/\s+/)
-                  .map((w) => w[0])
-                  .join('')
-                  .slice(0, 2)
-                  .toUpperCase()}
+            {!trackReceivedIds.includes(p.id) && (
+              <div
+                className="video-placeholder"
+                style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
+              >
+                <div className="initial-badge">
+                  {p.name
+                    .trim()
+                    .split(/\s+/)
+                    .map((w) => w[0])
+                    .join('')
+                    .slice(0, 2)
+                    .toUpperCase()}
+                </div>
+                connecting to {p.name}…
               </div>
-              connecting to {p.name}…
-            </div>
+            )}
             <video
               ref={(el) => {
                 videoRefs.current[p.id] = el;
               }}
               autoPlay
               playsInline
-              onPlay={(e) => {
-                const holder = (e.target as HTMLVideoElement).previousSibling as HTMLElement;
-                if (holder) holder.style.display = 'none';
-              }}
             />
             {needsAudioUnlock.includes(p.id) && (
               <button
@@ -595,7 +604,7 @@ export default function RoomPage() {
                 style={{ position: 'absolute', bottom: 12, right: 12 }}
                 onClick={() => unlockAudio(p.id)}
               >
-                Tap to enable sound
+                Tap to start video &amp; audio
               </button>
             )}
             <div className="video-label">{p.name}</div>
