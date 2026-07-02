@@ -30,14 +30,20 @@ create table if not exists public.posts (
   created_at timestamptz not null default now()
 );
 
--- One row per person currently seated in a conversation.
+-- One row per person currently seated in a conversation. last_seen is a
+-- heartbeat: each client "touches" its own row periodically while it's in
+-- the room, so we can tell a real seat apart from a stale one left behind
+-- by a closed tab or dropped connection.
 create table if not exists public.post_participants (
   post_id uuid not null references public.posts(id) on delete cascade,
   user_id uuid not null references auth.users(id) on delete cascade,
   display_name text not null,
   joined_at timestamptz not null default now(),
+  last_seen timestamptz not null default now(),
   primary key (post_id, user_id)
 );
+
+alter table public.post_participants add column if not exists last_seen timestamptz not null default now();
 
 -- One row per finished conversation, kept privately per user.
 create table if not exists public.session_history (
@@ -57,7 +63,10 @@ create table if not exists public.session_history (
 -- do atomic, race-safe seat-limit checks that RLS alone can't express)
 -- ============================================================
 
--- Enforce the seat limit atomically when someone tries to join.
+-- Enforce the seat limit atomically when someone tries to join. Before
+-- counting, sweep out any seats that have gone stale (no heartbeat in
+-- over a minute) so a disconnected phone/tab from an earlier session
+-- can never block a real join.
 create or replace function public.enforce_seat_limit()
 returns trigger
 language plpgsql
@@ -80,6 +89,10 @@ begin
   if post_status <> 'open' then
     raise exception 'That conversation is no longer open.';
   end if;
+
+  delete from public.post_participants
+  where post_id = new.post_id
+    and last_seen < now() - interval '60 seconds';
 
   select count(*) into current_count
   from public.post_participants where post_id = new.post_id;
@@ -203,6 +216,21 @@ create trigger trg_cleanup_vote_on_leave
   after delete on public.post_participants
   for each row execute function public.cleanup_vote_on_leave();
 
+-- Callable from any signed-in client (the plaza calls this every so often)
+-- to sweep out stale seats globally, so an empty-but-ghost-occupied room
+-- disappears from the board even if nobody happens to be trying to join
+-- it right now.
+create or replace function public.cleanup_stale_participants()
+returns void
+language plpgsql
+security definer
+as $$
+begin
+  delete from public.post_participants
+  where last_seen < now() - interval '60 seconds';
+end;
+$$;
+
 -- ============================================================
 -- ROW LEVEL SECURITY
 -- ============================================================
@@ -258,6 +286,13 @@ drop policy if exists "you can take your own seat" on public.post_participants;
 create policy "you can take your own seat"
   on public.post_participants for insert
   to authenticated
+  with check (auth.uid() = user_id);
+
+drop policy if exists "you can heartbeat your own seat" on public.post_participants;
+create policy "you can heartbeat your own seat"
+  on public.post_participants for update
+  to authenticated
+  using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
 
 drop policy if exists "you can leave your own seat" on public.post_participants;

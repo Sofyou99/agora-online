@@ -39,6 +39,8 @@ export default function RoomPage() {
   const [voteCount, setVoteCount] = useState(0);
   const [voteRequired, setVoteRequired] = useState(2);
   const [hasVoted, setHasVoted] = useState(false);
+  const [mediaState, setMediaState] = useState<'pending' | 'full' | 'audio-only' | 'none'>('pending');
+  const [needsAudioUnlock, setNeedsAudioUnlock] = useState<string[]>([]);
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
@@ -52,6 +54,7 @@ export default function RoomPage() {
   const postRef = useRef<PostRow | null>(null);
   const partnerNamesRef = useRef<string[]>([]);
   const speakingDetectorsRef = useRef<Record<string, SpeakingDetector>>({});
+  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     postRef.current = post;
@@ -84,26 +87,46 @@ export default function RoomPage() {
       if (cancelled) return;
       setPost(postData as PostRow);
 
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        localStreamRef.current = stream;
-        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-        startSpeakingDetection(userId, stream);
-      } catch (e) {
-        setError(
-          "We couldn't access your camera or microphone. Check your browser's permission icon in the address bar, allow access, then rejoin from the plaza."
-        );
-        setConnText('media blocked');
-        return;
-      }
+      await tryAcquireMedia(userId);
 
       setupPostSubscription();
       setupVotesSubscription(userId);
       setupRoomChannel(userId, name);
+      startHeartbeat(userId);
+    }
+
+    async function tryAcquireMedia(userId: string) {
+      // Try camera+mic, then mic-only, then no media at all — but in every
+      // case we still join the room's presence channel below, so a device
+      // with no working camera/mic still shows up as present to everyone
+      // else instead of silently vanishing.
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        localStreamRef.current = stream;
+        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        startSpeakingDetection(userId, stream);
+        setMediaState('full');
+        return;
+      } catch (e) {
+        // fall through to audio-only
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+        localStreamRef.current = stream;
+        setCamOn(false);
+        startSpeakingDetection(userId, stream);
+        setMediaState('audio-only');
+        setError(
+          "We couldn't access your camera, so you're joining audio-only. Others will still see and hear you're here."
+        );
+        return;
+      } catch (e) {
+        // fall through to no media
+      }
+      setMediaState('none');
+      setError(
+        "We couldn't access your camera or microphone at all. Check your browser's permission icon in the address bar and allow access, then rejoin — you're still visible to others in the room, just without audio or video for now."
+      );
     }
 
     boot();
@@ -194,6 +217,7 @@ export default function RoomPage() {
         } catch (e) {}
         delete peersRef.current[pid];
         stopSpeakingDetection(pid);
+        setNeedsAudioUnlock((prev) => prev.filter((id) => id !== pid));
       }
     });
 
@@ -220,7 +244,18 @@ export default function RoomPage() {
 
     pc.ontrack = (ev) => {
       const v = videoRefs.current[peerId];
-      if (v) v.srcObject = ev.streams[0];
+      if (v) {
+        v.srcObject = ev.streams[0];
+        const playPromise = v.play();
+        if (playPromise && typeof playPromise.catch === 'function') {
+          playPromise.catch(() => {
+            // Many mobile browsers block autoplay of an unmuted remote
+            // stream until the person taps something — surface a button
+            // instead of silently never playing audio.
+            setNeedsAudioUnlock((prev) => (prev.includes(peerId) ? prev : [...prev, peerId]));
+          });
+        }
+      }
       startSpeakingDetection(peerId, ev.streams[0]);
     };
 
@@ -286,6 +321,14 @@ export default function RoomPage() {
     }
   }
 
+  function unlockAudio(peerId: string) {
+    const v = videoRefs.current[peerId];
+    if (v) {
+      v.play().catch(() => {});
+    }
+    setNeedsAudioUnlock((prev) => prev.filter((id) => id !== peerId));
+  }
+
   // ---------- speaking indicator ----------
   function startSpeakingDetection(id: string, stream: MediaStream) {
     if (speakingDetectorsRef.current[id]) return;
@@ -328,6 +371,21 @@ export default function RoomPage() {
     }
     const el = document.getElementById('pane-' + id);
     if (el) el.classList.remove('speaking');
+  }
+
+  // ---------- heartbeat (keeps our seat from going stale/ghost) ----------
+  function startHeartbeat(userId: string) {
+    if (heartbeatIntervalRef.current) return;
+    const touch = () => {
+      supabase
+        .from('post_participants')
+        .update({ last_seen: new Date().toISOString() })
+        .eq('post_id', postId)
+        .eq('user_id', userId)
+        .then(() => {});
+    };
+    touch();
+    heartbeatIntervalRef.current = setInterval(touch, 15000);
   }
 
   // ---------- timer ----------
@@ -396,6 +454,10 @@ export default function RoomPage() {
     if (roomChannelRef.current) supabase.removeChannel(roomChannelRef.current);
     if (postChannelRef.current) supabase.removeChannel(postChannelRef.current);
     if (votesChannelRef.current) supabase.removeChannel(votesChannelRef.current);
+    if (heartbeatIntervalRef.current) {
+      clearInterval(heartbeatIntervalRef.current);
+      heartbeatIntervalRef.current = null;
+    }
   }
 
   async function leaveRoom() {
@@ -480,7 +542,22 @@ export default function RoomPage() {
 
       <div className={stageClass}>
         <div className="video-pane" id={'pane-' + (myIdRef.current || 'me')}>
-          <video ref={localVideoRef} autoPlay playsInline muted />
+          {mediaState === 'full' && camOn ? (
+            <video ref={localVideoRef} autoPlay playsInline muted />
+          ) : (
+            <div className="video-placeholder">
+              <div className="initial-badge">
+                {myNameRef.current
+                  .trim()
+                  .split(/\s+/)
+                  .map((w) => w[0])
+                  .join('')
+                  .slice(0, 2)
+                  .toUpperCase()}
+              </div>
+              {mediaState === 'none' ? 'no camera or mic' : mediaState === 'audio-only' ? 'audio only' : 'camera off'}
+            </div>
+          )}
           <div className="video-label">you</div>
         </div>
 
@@ -512,16 +589,24 @@ export default function RoomPage() {
                 if (holder) holder.style.display = 'none';
               }}
             />
+            {needsAudioUnlock.includes(p.id) && (
+              <button
+                className="btn btn-primary btn-sm"
+                style={{ position: 'absolute', bottom: 12, right: 12 }}
+                onClick={() => unlockAudio(p.id)}
+              >
+                Tap to enable sound
+              </button>
+            )}
             <div className="video-label">{p.name}</div>
           </div>
         ))}
 
-        {post?.mode === 'group' &&
-          Array.from({ length: openSeats }).map((_, i) => (
-            <div className="video-pane empty-seat" key={'empty-' + i}>
-              open seat
-            </div>
-          ))}
+        {Array.from({ length: openSeats }).map((_, i) => (
+          <div className="video-pane empty-seat" key={'empty-' + i}>
+            {post?.mode === 'duo' ? 'waiting for someone to join' : 'open seat'}
+          </div>
+        ))}
       </div>
 
       <div className="controls-row">

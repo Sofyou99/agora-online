@@ -86,6 +86,7 @@ export default function PlazaPage() {
   const [busy, setBusy] = useState(false);
   const [shuffledTopics, setShuffledTopics] = useState<string[]>(() => pickRandomTopics(CHIP_COUNT));
   const channelRef = useRef<any>(null);
+  const cleanupIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refresh = useCallback(async () => {
     const { data, error } = await supabase
@@ -122,6 +123,7 @@ export default function PlazaPage() {
       if (cancelled) return;
       setMyId(data.user.id);
       setMyName(localStorage.getItem('agora_name') || 'Someone');
+      await supabase.rpc('cleanup_stale_participants');
       await refresh();
       await refreshHistory(data.user.id);
 
@@ -131,11 +133,17 @@ export default function PlazaPage() {
         .on('postgres_changes', { event: '*', schema: 'public', table: 'post_participants' }, () => refresh())
         .subscribe();
       channelRef.current = channel;
+
+      const cleanupInterval = setInterval(() => {
+        supabase.rpc('cleanup_stale_participants');
+      }, 15000);
+      cleanupIntervalRef.current = cleanupInterval;
     }
     boot();
     return () => {
       cancelled = true;
       if (channelRef.current) supabase.removeChannel(channelRef.current);
+      if (cleanupIntervalRef.current) clearInterval(cleanupIntervalRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
