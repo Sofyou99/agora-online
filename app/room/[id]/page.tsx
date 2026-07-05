@@ -89,6 +89,7 @@ export default function RoomPage() {
         }
         localStreamRef.current = stream;
         if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+        setConnText('connecting to the room…');
       } catch (e) {
         setError(
           "We couldn't access your camera or microphone. Check your browser's permission icon in the address bar, allow access, then rejoin from the plaza."
@@ -157,7 +158,24 @@ export default function RoomPage() {
       if (status === 'SUBSCRIBED') {
         await room.track({ name, joinedAt: Date.now() });
       }
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        setError(
+          `The realtime connection to Supabase reported "${status}". This usually means something on your network or browser — a firewall, VPN, or privacy/ad-blocking extension — is blocking WebSocket connections. Try an incognito window with extensions disabled, or a different network.`
+        );
+      }
     });
+
+    setTimeout(() => {
+      setDebugChannelStatus((current) => {
+        if (current === 'not started') {
+          setError(
+            'The realtime connection to Supabase never reported any status after 10 seconds — normally you\'d see "SUBSCRIBED" or an error almost instantly. This strongly suggests something is blocking WebSocket connections (a firewall, VPN, or browser extension). Try an incognito window with extensions off, or a different network.'
+          );
+          return 'stuck — no response after 10s';
+        }
+        return current;
+      });
+    }, 10000);
 
     roomChannelRef.current = room;
   }
