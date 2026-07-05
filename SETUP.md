@@ -140,34 +140,7 @@ the DNS instructions Vercel shows you (usually adding a CNAME or A record
 at your domain registrar). This part is entirely between you, Vercel, and
 your registrar — I can't touch DNS from here either.
 
-## 10. Set up the Suggestions page (optional)
-
-The "Suggestions" tab lets anyone using the app send you a note by email —
-no database, no dashboard to check, it just lands in your inbox.
-
-1. Sign up at https://resend.com (free tier: 100 emails/day, 3,000/month —
-   plenty for this).
-2. In the Resend dashboard, go to **API Keys** → **Create API Key**. Copy it.
-3. Add these to `.env.local` (and later to Vercel's environment variables):
-   ```
-   RESEND_API_KEY=re_your_key_here
-   SUGGESTIONS_TO_EMAIL=the-email-you-signed-up-to-resend-with@example.com
-   ```
-4. **Important restriction to know about**: until you verify a domain with
-   Resend (Domains → Add Domain — requires editing DNS records for a
-   domain you own), you can only send *to* the exact email address you
-   used to create your Resend account. That's actually perfect for this
-   feature, since the whole point is suggestions landing in *your* inbox —
-   just make sure `SUGGESTIONS_TO_EMAIL` matches your Resend account email
-   exactly. If you later want suggestions to go to a different address
-   (e.g. a team inbox), verify a domain first.
-5. Restart `npm run dev` (or redeploy on Vercel) after adding the env vars.
-
-If you skip this entirely, the Suggestions page will still load — people
-will just see a polite error when they try to send something, instead of
-the app crashing.
-
-## 11. Before opening this up publicly
+## 10. Before opening this up publicly
 
 A few things worth deciding before real strangers start using this:
 

@@ -16,8 +16,7 @@ type PostRow = {
   duration_minutes: number;
   extended_minutes: number;
 };
-type PeerEntry = { pc: RTCPeerConnection | null; isCaller: boolean; answerApplied: boolean; pending?: boolean };
-type SpeakingDetector = { ctx: AudioContext; raf: number };
+type PeerEntry = { pc: RTCPeerConnection; isCaller: boolean; answerApplied: boolean };
 
 export default function RoomPage() {
   const params = useParams<{ id: string }>();
@@ -36,12 +35,7 @@ export default function RoomPage() {
   const [showWrapup, setShowWrapup] = useState(false);
   const [wrapupSummary, setWrapupSummary] = useState('');
   const [stars, setStars] = useState(0);
-  const [voteCount, setVoteCount] = useState(0);
-  const [voteRequired, setVoteRequired] = useState(2);
-  const [hasVoted, setHasVoted] = useState(false);
-  const [mediaState, setMediaState] = useState<'pending' | 'full' | 'audio-only' | 'none'>('pending');
-  const [needsAudioUnlock, setNeedsAudioUnlock] = useState<string[]>([]);
-  const [trackReceivedIds, setTrackReceivedIds] = useState<string[]>([]);
+  const [reflection, setReflection] = useState('');
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
@@ -49,23 +43,10 @@ export default function RoomPage() {
   const peersRef = useRef<Record<string, PeerEntry>>({});
   const roomChannelRef = useRef<any>(null);
   const postChannelRef = useRef<any>(null);
-  const votesChannelRef = useRef<any>(null);
   const myIdRef = useRef<string | null>(null);
   const myNameRef = useRef<string>('Someone');
   const postRef = useRef<PostRow | null>(null);
   const partnerNamesRef = useRef<string[]>([]);
-  const speakingDetectorsRef = useRef<Record<string, SpeakingDetector>>({});
-  const heartbeatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const postBackstopPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const mediaReadyRef = useRef<{ promise: Promise<void>; resolve: () => void }>(
-    (() => {
-      let resolveFn: () => void = () => {};
-      const promise = new Promise<void>((res) => {
-        resolveFn = res;
-      });
-      return { promise, resolve: resolveFn };
-    })()
-  );
 
   useEffect(() => {
     postRef.current = post;
@@ -98,87 +79,24 @@ export default function RoomPage() {
       if (cancelled) return;
       setPost(postData as PostRow);
 
-      // Presence and the timer must never wait on a camera/mic permission
-      // prompt — join the room and start syncing immediately. Actual
-      // video/audio connections wait for media separately, below.
-      setupPostSubscription();
-      setupVotesSubscription(userId);
-      setupRoomChannel(userId, name);
-      startHeartbeat(userId);
-      startPostBackstopPoll();
-
-      tryAcquireMedia(userId);
-    }
-
-    function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-      return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('media request timed out')), ms);
-        promise.then(
-          (v) => {
-            clearTimeout(timer);
-            resolve(v);
-          },
-          (e) => {
-            clearTimeout(timer);
-            reject(e);
-          }
-        );
-      });
-    }
-
-    async function tryAcquireMedia(userId: string) {
-      // Try camera+mic, then mic-only, then no media at all — but in every
-      // case the room, presence, and timer are already running above, so a
-      // device with no working camera/mic (or a slow permission prompt)
-      // still shows up as present to everyone else instead of blocking or
-      // silently vanishing.
       try {
-        const stream = await withTimeout(
-          navigator.mediaDevices.getUserMedia({ video: true, audio: true }),
-          8000
-        );
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+        if (cancelled) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
         localStreamRef.current = stream;
         if (localVideoRef.current) localVideoRef.current.srcObject = stream;
-        startSpeakingDetection(userId, stream);
-        setMediaState('full');
-        mediaReadyRef.current.resolve();
-        return;
       } catch (e) {
-        // fall through to audio-only
-      }
-      try {
-        const stream = await withTimeout(
-          navigator.mediaDevices.getUserMedia({ video: false, audio: true }),
-          8000
-        );
-        localStreamRef.current = stream;
-        setCamOn(false);
-        startSpeakingDetection(userId, stream);
-        setMediaState('audio-only');
         setError(
-          "We couldn't access your camera, so you're joining audio-only. Others will still see and hear you're here."
+          "We couldn't access your camera or microphone. Check your browser's permission icon in the address bar, allow access, then rejoin from the plaza."
         );
-        mediaReadyRef.current.resolve();
+        setConnText('media blocked');
         return;
-      } catch (e) {
-        // fall through to no media
       }
-      setMediaState('none');
-      setError(
-        "We couldn't access your camera or microphone at all. Check your browser's permission icon in the address bar and allow access, then rejoin — you're still visible to others in the room, just without audio or video for now."
-      );
-      mediaReadyRef.current.resolve();
-    }
 
-    function startPostBackstopPoll() {
-      // The realtime subscription above should keep everyone's timer in
-      // sync instantly, but if a push ever gets missed, this makes sure
-      // both sides converge within a few seconds regardless.
-      const poll = setInterval(async () => {
-        const { data } = await supabase.from('posts').select('*').eq('id', postId).single();
-        if (data) setPost(data as PostRow);
-      }, 5000);
-      postBackstopPollRef.current = poll;
+      setupPostSubscription(userId);
+      setupRoomChannel(userId, name);
     }
 
     boot();
@@ -189,7 +107,7 @@ export default function RoomPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [postId]);
 
-  function setupPostSubscription() {
+  function setupPostSubscription(userId: string) {
     const ch = supabase
       .channel(`post-row-${postId}`)
       .on(
@@ -199,26 +117,6 @@ export default function RoomPage() {
       )
       .subscribe();
     postChannelRef.current = ch;
-  }
-
-  async function refreshVotes(userId: string) {
-    const { data } = await supabase.from('post_extend_votes').select('user_id').eq('post_id', postId);
-    const rows = data || [];
-    setVoteCount(rows.length);
-    setHasVoted(rows.some((r: any) => r.user_id === userId));
-  }
-
-  function setupVotesSubscription(userId: string) {
-    refreshVotes(userId);
-    const ch = supabase
-      .channel(`extend-votes-${postId}`)
-      .on(
-        'postgres_changes',
-        { event: '*', schema: 'public', table: 'post_extend_votes', filter: `post_id=eq.${postId}` },
-        () => refreshVotes(userId)
-      )
-      .subscribe();
-    votesChannelRef.current = ch;
   }
 
   function setupRoomChannel(userId: string, name: string) {
@@ -231,7 +129,6 @@ export default function RoomPage() {
         return { id: key, name: meta.name, joinedAt: meta.joinedAt };
       });
       setParticipants(list);
-      setVoteRequired(Math.floor(list.length / 2) + 1);
       partnerNamesRef.current = list.filter((p) => p.id !== userId).map((p) => p.name);
       reconcilePeers(list, userId);
     });
@@ -265,17 +162,14 @@ export default function RoomPage() {
     Object.keys(peersRef.current).forEach((pid) => {
       if (!list.some((p) => p.id === pid)) {
         try {
-          peersRef.current[pid].pc?.close();
+          peersRef.current[pid].pc.close();
         } catch (e) {}
         delete peersRef.current[pid];
-        stopSpeakingDetection(pid);
-        setNeedsAudioUnlock((prev) => prev.filter((id) => id !== pid));
-        setTrackReceivedIds((prev) => prev.filter((id) => id !== pid));
       }
     });
 
     const connectedCount = Object.values(peersRef.current).filter(
-      (p: PeerEntry) => p.pc?.connectionState === 'connected'
+      (p: PeerEntry) => p.pc.connectionState === 'connected'
     ).length;
     if (list.length < 2) {
       setLive(false);
@@ -290,39 +184,14 @@ export default function RoomPage() {
   }
 
   async function createPeerConnection(peerId: string, isCaller: boolean, userId: string) {
-    // Mark this peer as being set up immediately (synchronously) so a
-    // second presence sync during the wait below can't try to create a
-    // duplicate connection for the same person.
-    peersRef.current[peerId] = { pc: null, isCaller, answerApplied: false, pending: true };
-
-    // Give media up to 5s to resolve so the initial offer/answer carries
-    // our tracks — but never block the connection indefinitely on it.
-    await Promise.race([mediaReadyRef.current.promise, new Promise<void>((res) => setTimeout(res, 5000))]);
-
-    // If the peer already left while we were waiting, bail out quietly.
-    if (!peersRef.current[peerId] || !peersRef.current[peerId].pending) return;
-
     const pc = new RTCPeerConnection({ iceServers: getIceServers() });
     peersRef.current[peerId] = { pc, isCaller, answerApplied: false };
 
     localStreamRef.current?.getTracks().forEach((t) => pc.addTrack(t, localStreamRef.current as MediaStream));
 
     pc.ontrack = (ev) => {
-      setTrackReceivedIds((prev) => (prev.includes(peerId) ? prev : [...prev, peerId]));
       const v = videoRefs.current[peerId];
-      if (v) {
-        v.srcObject = ev.streams[0];
-        const playPromise = v.play();
-        if (playPromise && typeof playPromise.catch === 'function') {
-          playPromise.catch(() => {
-            // Many mobile browsers block autoplay of an unmuted remote
-            // stream until the person taps something — surface a button
-            // instead of silently never playing audio or video.
-            setNeedsAudioUnlock((prev) => (prev.includes(peerId) ? prev : [...prev, peerId]));
-          });
-        }
-      }
-      startSpeakingDetection(peerId, ev.streams[0]);
+      if (v) v.srcObject = ev.streams[0];
     };
 
     pc.onicecandidate = (ev) => {
@@ -362,18 +231,8 @@ export default function RoomPage() {
 
   async function handleSignal(payload: any, userId: string) {
     const peerId = payload.from;
-    let entry = peersRef.current[peerId];
+    const entry = peersRef.current[peerId];
     if (!entry) return;
-
-    if (entry.pending || !entry.pc) {
-      // Our own connection object for this peer isn't ready yet (still
-      // waiting on media) — wait for the same bounded window
-      // createPeerConnection uses, then re-check.
-      await Promise.race([mediaReadyRef.current.promise, new Promise<void>((res) => setTimeout(res, 5000))]);
-      entry = peersRef.current[peerId];
-      if (!entry || !entry.pc) return;
-    }
-
     const pc = entry.pc;
 
     if (payload.kind === 'offer') {
@@ -395,73 +254,6 @@ export default function RoomPage() {
         await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
       } catch (e) {}
     }
-  }
-
-  function unlockAudio(peerId: string) {
-    const v = videoRefs.current[peerId];
-    if (v) {
-      v.play().catch(() => {});
-    }
-    setNeedsAudioUnlock((prev) => prev.filter((id) => id !== peerId));
-  }
-
-  // ---------- speaking indicator ----------
-  function startSpeakingDetection(id: string, stream: MediaStream) {
-    if (speakingDetectorsRef.current[id]) return;
-    if (stream.getAudioTracks().length === 0) return;
-    try {
-      const ctx = new AudioContext();
-      const source = ctx.createMediaStreamSource(stream);
-      const analyser = ctx.createAnalyser();
-      analyser.fftSize = 512;
-      source.connect(analyser);
-      const data = new Uint8Array(analyser.frequencyBinCount);
-
-      const loop = () => {
-        analyser.getByteTimeDomainData(data);
-        let sumSquares = 0;
-        for (let i = 0; i < data.length; i++) {
-          const v = (data[i] - 128) / 128;
-          sumSquares += v * v;
-        }
-        const rms = Math.sqrt(sumSquares / data.length);
-        const el = document.getElementById('pane-' + id);
-        if (el) el.classList.toggle('speaking', rms > 0.045);
-        const raf = requestAnimationFrame(loop);
-        if (speakingDetectorsRef.current[id]) speakingDetectorsRef.current[id].raf = raf;
-      };
-      const raf = requestAnimationFrame(loop);
-      speakingDetectorsRef.current[id] = { ctx, raf };
-    } catch (e) {
-      // Web Audio API unavailable — speaking indicator just won't show, no functional impact.
-    }
-  }
-  function stopSpeakingDetection(id: string) {
-    const d = speakingDetectorsRef.current[id];
-    if (d) {
-      cancelAnimationFrame(d.raf);
-      try {
-        d.ctx.close();
-      } catch (e) {}
-      delete speakingDetectorsRef.current[id];
-    }
-    const el = document.getElementById('pane-' + id);
-    if (el) el.classList.remove('speaking');
-  }
-
-  // ---------- heartbeat (keeps our seat from going stale/ghost) ----------
-  function startHeartbeat(userId: string) {
-    if (heartbeatIntervalRef.current) return;
-    const touch = () => {
-      supabase
-        .from('post_participants')
-        .update({ last_seen: new Date().toISOString() })
-        .eq('post_id', postId)
-        .eq('user_id', userId)
-        .then(() => {});
-    };
-    touch();
-    heartbeatIntervalRef.current = setInterval(touch, 15000);
   }
 
   // ---------- timer ----------
@@ -494,10 +286,8 @@ export default function RoomPage() {
     return () => clearInterval(t);
   }, [post]);
 
-  async function castExtendVote() {
-    const userId = myIdRef.current;
-    if (!userId || hasVoted) return;
-    const { error } = await supabase.from('post_extend_votes').upsert({ post_id: postId, user_id: userId });
+  async function extendTime() {
+    const { error } = await supabase.rpc('extend_time', { p_post_id: postId });
     if (error) alert(error.message);
   }
 
@@ -518,26 +308,16 @@ export default function RoomPage() {
   function cleanupAll() {
     Object.values(peersRef.current).forEach((p: PeerEntry) => {
       try {
-        p.pc?.close();
+        p.pc.close();
       } catch (e) {}
     });
     peersRef.current = {};
-    Object.keys(speakingDetectorsRef.current).forEach(stopSpeakingDetection);
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
       localStreamRef.current = null;
     }
     if (roomChannelRef.current) supabase.removeChannel(roomChannelRef.current);
     if (postChannelRef.current) supabase.removeChannel(postChannelRef.current);
-    if (votesChannelRef.current) supabase.removeChannel(votesChannelRef.current);
-    if (heartbeatIntervalRef.current) {
-      clearInterval(heartbeatIntervalRef.current);
-      heartbeatIntervalRef.current = null;
-    }
-    if (postBackstopPollRef.current) {
-      clearInterval(postBackstopPollRef.current);
-      postBackstopPollRef.current = null;
-    }
   }
 
   async function leaveRoom() {
@@ -554,6 +334,7 @@ export default function RoomPage() {
       partners.length ? `You talked through "${topic}" with ${partners.join(', ')}.` : `You opened the floor on "${topic}".`
     );
     setStars(0);
+    setReflection('');
     setShowWrapup(true);
   }
 
@@ -567,6 +348,7 @@ export default function RoomPage() {
         mode: p.mode,
         partners: partnerNamesRef.current,
         rating: stars,
+        reflection: reflection.trim() || null,
       });
     }
     router.push('/plaza');
@@ -576,11 +358,6 @@ export default function RoomPage() {
   const stageClass = 'video-stage ' + (post?.mode === 'duo' ? 'mode-duo' : 'mode-group');
   const others = participants.filter((p) => p.id !== myIdRef.current);
   const openSeats = post ? Math.max(0, post.max_seats - participants.length) : 0;
-  const extendLabel = hasVoted
-    ? `Waiting on others (${voteCount}/${voteRequired})`
-    : post?.mode === 'duo'
-    ? 'Agree to +15 min'
-    : `Vote to +15 min (${voteCount}/${voteRequired})`;
 
   return (
     <div className="app">
@@ -603,17 +380,17 @@ export default function RoomPage() {
         <div className="timer-panel">
           <div className={'timer-value' + (overtime ? ' overtime' : '')}>{timerText}</div>
           <div className="timer-caption">time remaining</div>
-          <button className="btn btn-ghost btn-sm" onClick={castExtendVote} disabled={hasVoted}>
-            {extendLabel}
+          <button className="btn btn-ghost btn-sm" onClick={extendTime}>
+            +15 min
           </button>
         </div>
       </div>
 
       {overtime && post?.started_at && (
         <div className="overtime-banner">
-          <span>Time&apos;s up — the conversation can keep going if everyone agrees.</span>
-          <button className="btn btn-primary btn-sm" onClick={castExtendVote} disabled={hasVoted}>
-            {extendLabel}
+          <span>Time&apos;s up — the conversation can keep going if you want it to.</span>
+          <button className="btn btn-primary btn-sm" onClick={extendTime}>
+            Add 15 more minutes
           </button>
         </div>
       )}
@@ -621,14 +398,16 @@ export default function RoomPage() {
       {error && <div className="error-banner">{error}</div>}
 
       <div className={stageClass}>
-        <div className="video-pane" id={'pane-' + (myIdRef.current || 'me')}>
-          {(mediaState !== 'full' || !camOn) && (
-            <div
-              className="video-placeholder"
-              style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
-            >
+        <div className="video-pane">
+          <video ref={localVideoRef} autoPlay playsInline muted />
+          <div className="video-label">you</div>
+        </div>
+
+        {others.map((p) => (
+          <div className="video-pane" key={p.id}>
+            <div className="video-placeholder" style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
               <div className="initial-badge">
-                {myNameRef.current
+                {p.name
                   .trim()
                   .split(/\s+/)
                   .map((w) => w[0])
@@ -636,63 +415,29 @@ export default function RoomPage() {
                   .slice(0, 2)
                   .toUpperCase()}
               </div>
-              {mediaState === 'none' ? 'no camera or mic' : mediaState === 'audio-only' ? 'audio only' : 'camera off'}
+              connecting to {p.name}…
             </div>
-          )}
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            muted
-            style={{ display: mediaState === 'full' && camOn ? 'block' : 'none' }}
-          />
-          <div className="video-label">you</div>
-        </div>
-
-        {others.map((p) => (
-          <div className="video-pane" id={'pane-' + p.id} key={p.id}>
-            {!trackReceivedIds.includes(p.id) && (
-              <div
-                className="video-placeholder"
-                style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}
-              >
-                <div className="initial-badge">
-                  {p.name
-                    .trim()
-                    .split(/\s+/)
-                    .map((w) => w[0])
-                    .join('')
-                    .slice(0, 2)
-                    .toUpperCase()}
-                </div>
-                connecting to {p.name}…
-              </div>
-            )}
             <video
               ref={(el) => {
                 videoRefs.current[p.id] = el;
               }}
               autoPlay
               playsInline
+              onPlay={(e) => {
+                const holder = (e.target as HTMLVideoElement).previousSibling as HTMLElement;
+                if (holder) holder.style.display = 'none';
+              }}
             />
-            {needsAudioUnlock.includes(p.id) && (
-              <button
-                className="btn btn-primary btn-sm"
-                style={{ position: 'absolute', bottom: 12, right: 12 }}
-                onClick={() => unlockAudio(p.id)}
-              >
-                Tap to start video &amp; audio
-              </button>
-            )}
             <div className="video-label">{p.name}</div>
           </div>
         ))}
 
-        {Array.from({ length: openSeats }).map((_, i) => (
-          <div className="video-pane empty-seat" key={'empty-' + i}>
-            {post?.mode === 'duo' ? 'waiting for someone to join' : 'open seat'}
-          </div>
-        ))}
+        {post?.mode === 'group' &&
+          Array.from({ length: openSeats }).map((_, i) => (
+            <div className="video-pane empty-seat" key={'empty-' + i}>
+              open seat
+            </div>
+          ))}
       </div>
 
       <div className="controls-row">
@@ -720,6 +465,11 @@ export default function RoomPage() {
                 </button>
               ))}
             </div>
+            <textarea
+              placeholder="One line on what stuck with you (optional)"
+              value={reflection}
+              onChange={(e) => setReflection(e.target.value)}
+            />
             <div className="wrapup-actions">
               <button className="btn btn-primary" onClick={finishWrapup}>
                 Back to the plaza

@@ -32,28 +32,7 @@ const TOPICS = [
   'Is suffering ever justified for the greater good?',
   'Can a good end justify bad means?',
   'Is total honesty always the right policy?',
-  'Does absolute freedom make people happier?',
-  'Is it wrong to eat animals?',
-  'Can art be judged objectively?',
-  'Should we colonize other planets?',
-  'Is nostalgia a trap or a comfort?',
-  'Do we have a duty to future generations?',
-  'Is privacy a right or a privilege?',
-  'Can a truly selfish act still be good?',
-  'Should death be optional?',
-  'Is tradition worth preserving for its own sake?',
 ];
-const CHIP_COUNT = 6;
-
-function pickRandomTopics(count: number) {
-  const pool = [...TOPICS];
-  const picked: string[] = [];
-  for (let i = 0; i < count && pool.length > 0; i++) {
-    const idx = Math.floor(Math.random() * pool.length);
-    picked.push(pool.splice(idx, 1)[0]);
-  }
-  return picked;
-}
 
 function seatCluster(filled: number, total: number) {
   const dots = [];
@@ -84,9 +63,7 @@ export default function PlazaPage() {
   const [topic, setTopic] = useState('');
   const [mode, setMode] = useState<'duo' | 'group'>('duo');
   const [busy, setBusy] = useState(false);
-  const [shuffledTopics, setShuffledTopics] = useState<string[]>(() => pickRandomTopics(CHIP_COUNT));
   const channelRef = useRef<any>(null);
-  const cleanupIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const refresh = useCallback(async () => {
     const { data, error } = await supabase
@@ -123,7 +100,6 @@ export default function PlazaPage() {
       if (cancelled) return;
       setMyId(data.user.id);
       setMyName(localStorage.getItem('agora_name') || 'Someone');
-      await supabase.rpc('cleanup_stale_participants');
       await refresh();
       await refreshHistory(data.user.id);
 
@@ -133,17 +109,11 @@ export default function PlazaPage() {
         .on('postgres_changes', { event: '*', schema: 'public', table: 'post_participants' }, () => refresh())
         .subscribe();
       channelRef.current = channel;
-
-      const cleanupInterval = setInterval(() => {
-        supabase.rpc('cleanup_stale_participants');
-      }, 15000);
-      cleanupIntervalRef.current = cleanupInterval;
     }
     boot();
     return () => {
       cancelled = true;
       if (channelRef.current) supabase.removeChannel(channelRef.current);
-      if (cleanupIntervalRef.current) clearInterval(cleanupIntervalRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -204,10 +174,6 @@ export default function PlazaPage() {
         <h2>What&apos;s being discussed</h2>
         <div className="who">
           you&apos;re {myName} ·{' '}
-          <a href="#" onClick={(e) => { e.preventDefault(); router.push('/suggestions'); }}>
-            suggestions
-          </a>{' '}
-          ·{' '}
           <a
             href="#"
             onClick={(e) => {
@@ -265,18 +231,9 @@ export default function PlazaPage() {
         <h3>Start a conversation</h3>
         <p className="hint">Give it a topic. No need to declare a side — just show up curious.</p>
 
-        <div className="field-label-row">
-          <span className="field-label">Need an idea?</span>
-          <button
-            type="button"
-            className="shuffle-btn"
-            onClick={() => setShuffledTopics(pickRandomTopics(CHIP_COUNT))}
-          >
-            ⤾ shuffle
-          </button>
-        </div>
+        <span className="field-label">Need an idea?</span>
         <div className="chips">
-          {shuffledTopics.map((t) => (
+          {TOPICS.map((t) => (
             <button key={t} className="chip" type="button" onClick={() => setTopic(t)}>
               {t}
             </button>
