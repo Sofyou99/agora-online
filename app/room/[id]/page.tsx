@@ -36,6 +36,8 @@ export default function RoomPage() {
   const [wrapupSummary, setWrapupSummary] = useState('');
   const [stars, setStars] = useState(0);
   const [reflection, setReflection] = useState('');
+  const [debugChannelStatus, setDebugChannelStatus] = useState('not started');
+  const [debugMyId, setDebugMyId] = useState('');
 
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const videoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
@@ -120,25 +122,38 @@ export default function RoomPage() {
   }
 
   function setupRoomChannel(userId: string, name: string) {
+    setDebugMyId(userId);
     const room = supabase.channel(`room-${postId}`, { config: { presence: { key: userId } } });
 
-    room.on('presence', { event: 'sync' }, () => {
+    function recomputeParticipants(source: string) {
       const state = room.presenceState() as Record<string, any[]>;
       const list: Participant[] = Object.entries(state).map(([key, metas]) => {
         const meta: any = metas[0];
         return { id: key, name: meta.name, joinedAt: meta.joinedAt };
       });
+      console.log('[Agora debug] presence recompute via', source, '->', list.length, 'people');
       setParticipants(list);
       partnerNamesRef.current = list.filter((p) => p.id !== userId).map((p) => p.name);
       reconcilePeers(list, userId);
-    });
+    }
+
+    // The high-level 'sync' convenience event is known to sometimes stop
+    // firing in hosted/production Supabase Realtime while the lower-level
+    // presence_state / presence_diff events keep working fine — so we
+    // listen to all three and recompute from the actual current state
+    // every time any of them fires. Cheap and fully robust either way.
+    room.on('presence', { event: 'sync' }, () => recomputeParticipants('sync'));
+    room.on('presence_state' as any, {} as any, () => recomputeParticipants('presence_state'));
+    room.on('presence_diff' as any, {} as any, () => recomputeParticipants('presence_diff'));
 
     room.on('broadcast', { event: 'signal' }, ({ payload }: any) => {
       if (payload.to !== userId) return;
       handleSignal(payload, userId);
     });
 
-    room.subscribe(async (status: string) => {
+    room.subscribe(async (status: string, err?: any) => {
+      console.log('[Agora debug] room channel status:', status, err || '');
+      setDebugChannelStatus(status + (err ? ` (${err.message || err})` : ''));
       if (status === 'SUBSCRIBED') {
         await room.track({ name, joinedAt: Date.now() });
       }
@@ -396,6 +411,28 @@ export default function RoomPage() {
       )}
 
       {error && <div className="error-banner">{error}</div>}
+
+      <div
+        style={{
+          background: '#111',
+          border: '1px solid #444',
+          borderRadius: 8,
+          padding: '10px 14px',
+          marginBottom: 16,
+          fontFamily: 'monospace',
+          fontSize: 12,
+          color: '#9f9',
+          lineHeight: 1.7,
+        }}
+      >
+        <div>DEBUG — post id: {postId}</div>
+        <div>DEBUG — my user id: {debugMyId || '(not set yet)'}</div>
+        <div>DEBUG — realtime channel status: {debugChannelStatus}</div>
+        <div>DEBUG — participants seen via presence: {participants.length}</div>
+        {participants.map((p) => (
+          <div key={p.id}>&nbsp;&nbsp;- {p.name} ({p.id})</div>
+        ))}
+      </div>
 
       <div className={stageClass}>
         <div className="video-pane">
